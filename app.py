@@ -17,8 +17,8 @@ from langchain_core.prompts import ChatPromptTemplate
 
 # 2. CONFIG
 
-#In case we reach the daily query limit on my account, we could switch to someone else's
-os.environ["GOOGLE_API_KEY"] = ""   #Note: don't commit this file with the API KEY in here, apparently bots crawl thru git to find vulnerable API keys to exploit.
+# In case we reach the daily query limit on my account, we could switch to someone else's
+os.environ["GOOGLE_API_KEY"] = "AIzaSyDT1pk-M3Ujvm_-8Xzy-auwEM2WBJbCw9Y"  # Note: don't commit this file with the API KEY in here, apparently bots crawl thru git to find vulnerable API keys to exploit.
 
 st.set_page_config(page_title="DPDP Compliance Bot")
 
@@ -26,6 +26,7 @@ st.set_page_config(page_title="DPDP Compliance Bot")
 st.image("logo.png", width=250)
 
 st.subheader("Ask me anything about the DPDP Act/IT Act/GDPR!")
+
 
 # 3. CLEAN TEXT
 
@@ -48,6 +49,7 @@ def clean_text(text):
         cleaned.append(line)
 
     return "\n".join(cleaned)
+
 
 # 4. INIT VECTOR DB
 
@@ -105,15 +107,18 @@ vector_db = init_vector_db()
 ## gemini-2.5-flash-lite/gemini-2.5-flash/gemini-3-flash-preview/<more to be added>
 
 llm = ChatGoogleGenerativeAI(
-    model="models/gemini-2.5-flash-lite",
+    model="models/gemini-3.1-flash-lite-preview",
     temperature=0
 )
 
 
-# 6. PROMPT
+# 6. PROMPT (now includes {history} for contextual memory)
 
 prompt = ChatPromptTemplate.from_template("""
 You are a legal compliance assistant specializing in DPDP Act 2023, GDPR, and IT Act 2000.
+
+Previous conversation (for context):
+{history}
 
 Use the provided context to answer the question.
 
@@ -134,6 +139,7 @@ If no relevant context is found:
 - Say: "I could not find sufficient information in the documents."
 - Then provide a general explanation based on your knowledge
 """)
+
 
 # 7. ANIMATED SPINNER
 
@@ -213,7 +219,12 @@ Answer only YES or NO. No explanation.
 
 Question: {query}"""
     )
-    answer = check.content.strip().upper()
+    if isinstance(check.content, list):
+        answer = check.content[0].get("text", "")
+    else:
+        answer = check.content
+
+    answer = answer.strip().upper()
     return answer.startswith("YES")
 
 
@@ -259,7 +270,7 @@ def expand_query(query: str):
     if "consent" in q:
         expanded.append(query + " user consent requirements law")
 
-    return list(set(expanded))
+    return list(set(expanded))  # If empty, system searches through all documents
 
 
 # 11. RETRIEVAL
@@ -296,8 +307,78 @@ def get_relevant_docs(query):
     return unique_docs[:12]
 
 
-# 12. UI (Not the Upendra movie)
+# 12. LAW CITATION MAP
+# Maps filename fragments → human-readable law name + emoji
 
+LAW_CITATION_MAP = {
+    "dpdp":     ("📘", "Digital Personal Data Protection Act, 2023"),
+    "gdpr":     ("🇪🇺", "General Data Protection Regulation (GDPR)"),
+    "it_act":   ("💻", "Information Technology Act, 2000"),
+    "certin":   ("🛡️", "CERT-In Directions, 2022"),
+    "rbi":      ("🏦", "RBI Digital Payment Security Guidelines"),
+    "dpdp_rules": ("📗", "DPDP Rules, 2025"),
+}
+
+def friendly_citation(filename: str, page) -> str:
+    """
+    Converts a raw filename + page into a human-readable law citation.
+    Falls back to the raw filename if no match is found.
+    """
+    fname = filename.lower()
+    for key, (emoji, law_name) in LAW_CITATION_MAP.items():
+        if key in fname:
+            return f"{emoji} {law_name} — p. {page}"
+    # Fallback: clean up the filename a bit
+    display = fname.replace("_", " ").replace(".pdf", "").title()
+    return f"📄 {display} — p. {page}"
+
+
+# 13. CONTEXTUAL MEMORY BUILDER
+# Injects the last N Q&A turns into the prompt as plain text
+
+def build_history_string(chat_history: list, n: int = 3) -> str:
+    """
+    Takes the last n user+assistant pairs from chat_history
+    and formats them as a readable conversation block.
+    Returns empty string if no history yet.
+    """
+    # Filter to only chat turns (not audit results)
+    chat_turns = [m for m in chat_history if m["role"] in ("user", "assistant")]
+
+    # Take the last n*2 messages (n pairs)
+    recent = chat_turns[-(n * 2):]
+
+    if not recent:
+        return "No prior conversation."
+
+    lines = []
+    for msg in recent:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        lines.append(f"{role}: {msg['content']}")
+
+    return "\n".join(lines)
+
+
+# 14. SESSION STATE INIT
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []  # list of {"role": ..., "content": ..., "sources": [...]}
+
+
+# 15. UI (Not the Upendra movie)
+
+# --- Render existing chat history ---
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+        # Re-render sources expander for assistant messages
+        if msg["role"] == "assistant" and msg.get("sources"):
+            with st.expander("📄 Sources"):
+                for citation in msg["sources"]:
+                    st.markdown(f"- {citation}")
+
+# --- Input row ---
 col1, col2 = st.columns([5, 2])
 with col1:
     user_query = st.text_area(
@@ -316,7 +397,15 @@ with col2:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+# --- Clear history button ---
+if st.session_state.chat_history:
+    if st.button("🗑️ Clear chat"):
+        st.session_state.chat_history = []
+        st.rerun()
+
 if user_query or uploaded_file:
+
+    current_history = st.session_state.chat_history.copy()
 
     # Bundle the entire pipeline into one function so
     # a single spinner covers all three stages seamlessly
@@ -376,9 +465,13 @@ if user_query or uploaded_file:
         docs = get_relevant_docs(user_query)
         context = "\n\n".join([d.page_content for d in docs])
 
+        # Build history string for contextual memory
+        history = build_history_string(current_history)
+
         response = llm.invoke(prompt.format(
             context=context,
-            question=user_query
+            question=user_query,
+            history=history
         ))
 
         return {
@@ -393,30 +486,58 @@ if user_query or uploaded_file:
         st.warning("Wait... what does this have to do with compliance?")
 
     elif result["mode"] == "audit":
-        st.subheader("📊 Compliance Auditor Report")
-        st.write(result["response"])
+        response_text = result["response"]
+        if isinstance(response_text, list):
+            response_text = response_text[0].get("text", "")
+
+        with st.chat_message("assistant"):
+            st.subheader("📊 Compliance Auditor Report")
+            st.write(response_text)
+
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "content": f"📊 **Compliance Audit Result:**\n\n{response_text}",
+            "sources": []
+        })
 
     elif result["mode"] == "chat":
-        st.subheader("🤖 Answer")
-
+        # Extract answer text
         try:
-            st.write(result["response"].content[0]["text"])
+            answer_text = result["response"].content[0]["text"]
         except:
-            st.write(result["response"].content)
-        # --- SOURCE REFERENCES ---
-        docs = result["docs"]
-        seen_sources = set()
-        unique_sources = []
+            answer_text = result["response"].content
 
-        for d in docs:
+        # Build law citations from retrieved docs
+        seen_citations = set()
+        citations = []
+        for d in result["docs"]:
             source = d.metadata.get("source", "Unknown")
             page = d.metadata.get("page", "?")
-            key = (source, page)
-            if key not in seen_sources:
-                seen_sources.add(key)
-                unique_sources.append((source, page))
+            citation = friendly_citation(source, page)
+            if citation not in seen_citations:
+                seen_citations.add(citation)
+                citations.append(citation)
 
-        if unique_sources:
-            with st.expander("📄 Sources"):
-                for source, page in sorted(unique_sources):
-                    st.markdown(f"- `{source}` — Page {page}")
+        # Render new user message
+        with st.chat_message("user"):
+            st.markdown(user_query)
+
+        # Render new assistant message
+        with st.chat_message("assistant"):
+            st.markdown(answer_text)
+            if citations:
+                with st.expander("📄 Sources"):
+                    for citation in sorted(citations):
+                        st.markdown(f"- {citation}")
+
+        # Persist to session state
+        st.session_state.chat_history.append({
+            "role": "user",
+            "content": user_query,
+            "sources": []
+        })
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "content": answer_text,
+            "sources": citations
+        })
